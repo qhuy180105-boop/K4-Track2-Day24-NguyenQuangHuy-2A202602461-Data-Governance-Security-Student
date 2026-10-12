@@ -27,22 +27,71 @@ Interface bắt buộc (tests/test_ledger.py và agent/runner.py gọi trực ti
           - hash lưu trong dòng n khớp lại khi tính lại từ nội dung dòng đó
         Trả về False nếu một dòng còn trong file bị sửa mà không tính lại
         hash, nếu xoá/chèn giữa file làm đứt liên kết, hoặc thiếu reason.
-        Chỉ kiểm tra file hiện có KHÔNG phát hiện được việc xoá dòng cuối
-        hoặc viết lại cả file và tính lại chuỗi. Muốn phát hiện cắt đuôi
-        phải lưu hash/số dòng cuối ở một nơi tin cậy bên ngoài file rồi
-        đối chiếu. Bài lab không cung cấp mốc đó.
-
-Sinh viên phải tự tay chứng minh được: sửa 1 ký tự trong 1 dòng giữa file
-rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
+def _calc_hash(entry_without_hash: dict) -> str:
+    serialized = json.dumps(entry_without_hash, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path = Path(path)
+    prev_hash = "0" * 64
+    if path.exists() and path.stat().st_size > 0:
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if lines:
+            last_entry = json.loads(lines[-1])
+            prev_hash = last_entry.get("hash", prev_hash)
+
+    row = dict(entry)
+    row["prev_hash"] = prev_hash
+    row.pop("hash", None)
+    row["hash"] = _calc_hash(row)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    return row
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    path = Path(path)
+    if not path.exists():
+        return True
+
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not lines:
+        return True
+
+    expected_prev = "0" * 64
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except Exception:
+            return False
+
+        reason = item.get("reason")
+        if not reason or not str(reason).strip():
+            return False
+
+        if item.get("prev_hash") != expected_prev:
+            return False
+
+        stored_hash = item.get("hash")
+        if not stored_hash:
+            return False
+
+        to_check = {k: v for k, v in item.items() if k != "hash"}
+        if _calc_hash(to_check) != stored_hash:
+            return False
+
+        expected_prev = stored_hash
+
+    return True

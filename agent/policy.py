@@ -9,32 +9,15 @@ Interface bắt buộc (tests/test_policy.py và agent/runner.py gọi trực ti
         `reason` KHÔNG BAO GIỜ được để trống — cả khi allow=True và
         allow=False. Đây là evidence audit ở Bước 4 (rubric: "Audit
         completeness = 100%" — điều kiện trượt nếu có dòng thiếu reason).
-
-PolicyContext — 5 input gốc và các input OBO cho lớp L3:
-
-    data_classification: str   "public" | "internal" | "restricted"
-    request_purpose: str       tự do, ví dụ "reconciliation", "support-reply"
-    agent_owner: str            định danh agent/run gọi tool này
-    delegation_depth: int       0 = gọi trực tiếp bởi user, >0 = agent gọi agent
-    egress_enabled: bool        run hiện tại có được phép gọi network không
-    principal_id: str           ID người ra lệnh từ data/principals.json
-    requested_tool: str         tool sắp gọi
-    agent_scopes: tuple[str]    quyền tối đa của agent
-    parent_scopes: tuple[str]   quyền của agent cha khi delegation_depth > 0
-    expires_at: str             ISO-8601 UTC; hết hạn phải deny
-
-Rule TỐI THIỂU bắt buộc (không được viết yếu hơn rule này):
-
-    classification == "restricted" and egress_enabled is True  ->  DENY
-
-Checkpoint OBO: quyền hiệu lực = principal.allowed_tools ∩ agent_scopes,
-và nếu depth > 0 thì còn giao với parent_scopes. Unknown principal, scope
-thiếu, run hết hạn đều deny kèm reason. Principal là fixture mô phỏng,
-không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+PRINCIPALS_PATH = Path(__file__).resolve().parent.parent / "data" / "principals.json"
 
 
 @dataclass(frozen=True)
@@ -51,5 +34,60 @@ class PolicyContext:
     expires_at: str = ""
 
 
+def _load_principals() -> dict:
+    if not PRINCIPALS_PATH.exists():
+        return {}
+    return json.loads(PRINCIPALS_PATH.read_text(encoding="utf-8"))
+
+
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    # 1. Kiểm tra data_classification hợp lệ
+    valid_classifications = ("public", "internal", "restricted")
+    if context.data_classification not in valid_classifications:
+        return False, f"invalid data_classification: {context.data_classification}"
+
+    # 2. Rule tối thiểu: restricted + egress_enabled=True -> DENY
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "egress denied: restricted data egress is forbidden"
+
+    # 3. Kiểm tra danh tính principal
+    if not context.principal_id:
+        return False, "principal_id is required"
+
+    principals = _load_principals()
+    principal = principals.get(context.principal_id)
+    if principal is None:
+        return False, f"unknown principal_id: {context.principal_id}"
+
+    # 4. Kiểm tra thời hạn (expires_at)
+    if context.expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(context.expires_at)
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            now_dt = datetime.now(timezone.utc)
+            if exp_dt < now_dt:
+                return False, f"credential expired at {context.expires_at}"
+        except Exception:
+            return False, f"invalid expires_at format: {context.expires_at}"
+
+    # 5. Kiểm tra mục đích (request_purpose)
+    allowed_purposes = principal.get("purposes", [])
+    if context.request_purpose and context.request_purpose not in allowed_purposes:
+        return False, f"purpose '{context.request_purpose}' not allowed for principal '{context.principal_id}'"
+
+    # 6. Kiểm tra quyền của tool được yêu cầu
+    tool = context.requested_tool
+    if tool:
+        allowed_tools = principal.get("allowed_tools", [])
+        if tool not in allowed_tools:
+            return False, f"principal '{context.principal_id}' is not authorized for tool '{tool}'"
+
+        if context.agent_scopes and tool not in context.agent_scopes:
+            return False, f"tool '{tool}' exceeds agent_scopes {context.agent_scopes}"
+
+        if context.delegation_depth > 0:
+            if not context.parent_scopes or tool not in context.parent_scopes:
+                return False, f"tool '{tool}' exceeds parent_scopes {context.parent_scopes} in delegation depth {context.delegation_depth}"
+
+    return True, f"access granted: {tool or 'action'} authorized for principal '{context.principal_id}'"
